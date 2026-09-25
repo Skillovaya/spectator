@@ -50,6 +50,12 @@ function docFor17(store) {
   return { getElementById: () => ({ _reactRootContainer: { _internalRoot: { current: fiber } } }) };
 }
 
+function docForFiber(fiber) {
+  const root = { children: [] };
+  const canvas = { parentElement: root, '__reactFiber$canvas': fiber };
+  return { getElementById: () => root, querySelector: () => canvas };
+}
+
 test('finds a local battle camera through the React 17 store', () => {
   const camera = makeCamera();
   const store = makeStore(camera);
@@ -66,9 +72,11 @@ test('diagnostic trace distinguishes a missing root, store, tank and camera', ()
 
   const noStore = {};
   const rootWithoutStore = { getElementById: () => ({ '__reactContainer$abc': { child: {} } }) };
-  assert.equal(resolveCamera(rootWithoutStore, noStore).code, 'STORE_NOT_FOUND');
+  assert.equal(resolveCamera(rootWithoutStore, noStore).code, 'CAMERA_PATH_NOT_FOUND');
   assert.equal(noStore.react.handle, 'react18');
   assert.ok(noStore.react.nodesChecked > 0);
+  assert.ok(noStore.discovery.fibers > 0);
+  assert.equal(noStore.discovery.objectsChecked, 0);
 
   const store = makeStore(makeCamera());
   store.subscribers.array_hd7ov6$_0 = [{ tank: { tag: 'EnemyTank' } }];
@@ -190,6 +198,108 @@ test('reports no visible React marker even when a canvas exists', () => {
   assert.deepEqual(trace.react.markers, { react17: 0, react18: 0, fiber: 0 });
   assert.equal(trace.react.nodesChecked, 0);
   assert.ok(trace.react.domNodesChecked >= 2);
+});
+
+test('finds a FollowCamera through React props without any store', () => {
+  const camera = makeCamera();
+  const trace = {};
+  const doc = docForFiber({ memoizedProps: { model: { scene: { camera } } } });
+  assert.equal(resolveCamera(doc, trace).camera, camera);
+  assert.equal(trace.result, 'READY');
+  assert.equal(trace.react.storePath, null);
+  assert.equal(trace.discovery.selected, 'uniqueFollowCamera');
+  assert.equal(trace.discovery.path, 'fiber.props.model.scene.camera');
+});
+
+test('direct camera discovery reports missing methods rather than patching incompatible objects', () => {
+  const camera = makeCamera();
+  delete camera.pitch_0.update_dleff0$;
+  const trace = {};
+  assert.equal(resolveCamera(docForFiber({ memoizedProps: { camera } }), trace).code,
+    'CAMERA_INCOMPATIBLE');
+  assert.ok(trace.discovery.candidates[0].missing.includes('pitch_0.update_dleff0$'));
+});
+
+test('does not select a directly discovered camera before a canvas appears', () => {
+  const camera = makeCamera();
+  const root = { '__reactContainer$app': { memoizedProps: { game: { camera } } } };
+  const trace = {};
+  assert.equal(resolveCamera({ getElementById: () => root }, trace).code, 'BATTLE_NOT_READY');
+  assert.equal(trace.discovery.selected, 'uniqueFollowCamera');
+});
+
+test('finds a camera from React context and function-component hooks', () => {
+  const camera = makeCamera();
+  const doc = docForFiber({
+    memoizedState: { memoizedState: { app: { gameCamera: camera } } },
+    dependencies: { firstContext: { memoizedValue: { app: { gameCamera: camera } } } }
+  });
+  const trace = {};
+  assert.equal(resolveCamera(doc, trace).camera, camera);
+  assert.equal(trace.discovery.compatibleCameras, 1);
+  assert.equal(trace.discovery.selected, 'uniqueFollowCamera');
+});
+
+test('prefers a local tank camera over another compatible camera', () => {
+  const localCamera = makeCamera();
+  const otherCamera = makeCamera();
+  const local = { tag: 'LocalTank', components_0: { array: [{ followCamera_0: localCamera }] } };
+  const doc = docForFiber({ memoizedProps: { game: { tank: local, camera: otherCamera } } });
+  const trace = {};
+  assert.equal(resolveCamera(doc, trace).camera, localCamera);
+  assert.equal(trace.discovery.selected, 'localTank');
+  assert.equal(trace.discovery.localTanks, 1);
+  assert.equal(trace.discovery.compatibleCameras, 1);
+});
+
+test('refuses an ambiguous camera and does not read unrelated getters or log game values', () => {
+  const camera = makeCamera();
+  const other = makeCamera();
+  camera.nickname = 'PRIVATE_PLAYER';
+  camera.pivot_0.value.x = 31415926;
+  let getterCalls = 0;
+  const props = { game: { camera, followCamera_0: other } };
+  Object.defineProperty(props, 'secretData', {
+    enumerable: true, get() { getterCalls++; return { camera }; }
+  });
+  const trace = {};
+  const result = resolveCamera(docForFiber({ memoizedProps: props }), trace);
+  assert.equal(result.code, 'CAMERA_AMBIGUOUS');
+  assert.equal(getterCalls, 0);
+  assert.equal(trace.discovery.compatibleCameras, 2);
+  const diagnostics = createDiagnostics({ location: { hostname: 'tankionline.com' } });
+  diagnostics.record('warn', 'CAMERA_PROBE', { trace });
+  assert.ok(!diagnostics.report().includes('PRIVATE_PLAYER'));
+  assert.ok(!diagnostics.report().includes('31415926'));
+  assert.ok(!diagnostics.report().includes('secretData'));
+});
+
+test('a missing camera reports bounded structural hints instead of missing store', () => {
+  const trace = {};
+  const doc = docForFiber({ memoizedProps: { battleController: { gameScene: { items: [] } } } });
+  assert.equal(resolveCamera(doc, trace).code, 'CAMERA_PATH_NOT_FOUND');
+  assert.equal(trace.discovery.cameraLike, 0);
+  assert.ok(trace.discovery.hints.some(item => item.fields.includes('battleController')));
+  assert.equal(trace.discovery.anchors.props, 1);
+  assert.ok(trace.discovery.objectsChecked < 1200);
+});
+
+test('bounds direct object discovery on large and cyclic React state graphs', () => {
+  const first = {};
+  let fiber = first;
+  for (let index = 0; index < 80; index++) {
+    fiber.memoizedProps = {
+      game: { children: Array.from({ length: 16 }, () => ({ game: { children: [] } })) }
+    };
+    fiber.sibling = {};
+    fiber = fiber.sibling;
+  }
+  first.alternate = first;
+  const trace = {};
+  assert.equal(resolveCamera(docForFiber(first), trace).code, 'CAMERA_PATH_NOT_FOUND');
+  assert.ok(trace.discovery.objectsChecked <= 1200);
+  assert.ok(trace.discovery.references <= 2400);
+  assert.equal(trace.discovery.limitReached, true);
 });
 
 test('supports the game-mode possessed tank layout and reports unknown camera shapes', () => {

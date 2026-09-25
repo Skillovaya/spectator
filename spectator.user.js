@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tanki Online — Spectator (свободная камера)
 // @namespace    https://github.com/Skillovaya/spectator
-// @version      0.3.0
+// @version      0.4.0
 // @description  Локальная свободная камера в браузерной версии Танков Онлайн; не даёт права настоящего спектатора.
 // @match        https://tankionline.com/play*
 // @match        https://*.tankionline.com/play*
@@ -17,7 +17,7 @@
 
   // These are private names of the HTML5 client's FollowCamera, not a public API.
   // If the client changes, fail closed rather than modifying a different object.
-  const VERSION = '0.3.0';
+  const VERSION = '0.4.0';
   const PIVOT_UPDATE = 'update_sl07mc$';
   const NUMBER_UPDATE = 'update_dleff0$';
   const MOVE_KEYS = new Set([
@@ -145,7 +145,7 @@
     return [];
   }
 
-  function findStore(doc, trace) {
+  function findStore(doc, trace, fibers) {
     const root = doc.getElementById('root');
     const canvas = doc.querySelector?.('canvas');
     if (trace) trace.root = {
@@ -227,14 +227,19 @@
       value.subscribers && value.state);
     const queue = seeds.slice();
     const visited = new Set();
+    let firstStore = null;
     for (let index = 0; index < queue.length && visited.size < 700; index++) {
       const { fiber: node, kind, source } = queue[index];
       if (!node || typeof node !== 'object' || visited.has(node)) continue;
       visited.add(node);
+      if (fibers) fibers.push(node); // Transient references: never put Fibers in the log.
       if (trace) trace.react.nodesChecked = visited.size;
       const found = (store, path) => {
         if (!isGameStore(store)) return null;
-        if (trace) Object.assign(trace.react, { handle: kind, source, storePath: path });
+        if (!firstStore) {
+          firstStore = store;
+          if (trace) Object.assign(trace.react, { handle: kind, source, storePath: path });
+        }
         return store;
       };
       try {
@@ -250,7 +255,7 @@
         ];
         for (const [path, value] of candidates) {
           const store = found(value, path);
-          if (store) return store;
+          if (store && !fibers) return store;
         }
         // Function components may hold the store in the first few React hooks.
         const checkedHooks = new Set();
@@ -259,7 +264,7 @@
           checkedHooks.add(hook);
           const store = found(hook.memoizedState, `hook[${count}].memoizedState`) ||
             found(hook.memoizedState?.store, `hook[${count}].memoizedState.store`);
-          if (store) return store;
+          if (store && !fibers) return store;
         }
         for (const fiber of [node.return, node.child, node.sibling, node.alternate]) {
           if (fiber && !visited.has(fiber)) queue.push({ fiber, kind, source });
@@ -272,7 +277,7 @@
       }
     }
     if (trace) trace.react.searchLimitReached = visited.size >= 700;
-    return null;
+    return firstStore;
   }
 
   function findLocalTank(store, trace) {
@@ -391,6 +396,160 @@
     return candidate;
   }
 
+  // A store is only one possible route to the FollowCamera. Current builds may
+  // expose game instances in React props, hooks, refs or context instead. Follow
+  // references from Fibers, never window/globals; inspect descriptors rather
+  // than invoking unknown getters and stop at strict depth/object limits.
+  function findCameraFromFibers(fibers, trace) {
+    const MAX_OBJECTS = 1200;
+    const MAX_REFERENCES = 2400;
+    const MAX_DEPTH = 5;
+    const GAME_FIELD = /camera|tank|battle|game|world|scene|engine|render|component|entity|posses|physics|controller|store/i;
+    const ROUTE_FIELD = /camera|tank|battle|game|world|scene|engine|render|component|entity|posses|physics|controller|store|context|state|value|current|ref|array|props|body|data|manager|instance|model|children/i;
+    const pathField = key => !PRIVATE_FIELD.test(key) &&
+      /^[a-z_$][\w$]{0,48}$/i.test(key) && ROUTE_FIELD.test(key) ? key : '<field>';
+    const high = [];
+    const low = [];
+    const seen = new Set();
+    let readErrors = 0;
+    let inspected = 0;
+    let fieldsTruncated = 0;
+    const hints = [];
+    const tanks = new Map();
+    const cameras = new Map();
+    const enqueue = (value, path, depth, priority = false) => {
+      if (!value || typeof value !== 'object' || seen.has(value) ||
+        seen.size >= MAX_REFERENCES || depth > MAX_DEPTH) return;
+      try {
+        if (typeof value.nodeType === 'number' || ArrayBuffer.isView(value) ||
+          value instanceof ArrayBuffer) return;
+      } catch (_) { readErrors++; return; }
+      seen.add(value);
+      (priority ? high : low).push({ value, path, depth });
+    };
+    const anchors = { instance: 0, context: 0, ref: 0, prototype: 0, hook: 0, state: 0, props: 0 };
+    const addAnchor = (value, kind, priority) => {
+      const before = seen.size;
+      enqueue(value, `fiber.${kind}`, 0, priority);
+      if (seen.size > before) anchors[kind]++;
+    };
+    for (const fiber of fibers) {
+      try {
+        addAnchor(fiber.stateNode, 'instance', true);
+        addAnchor(fiber.dependencies?.firstContext?.memoizedValue, 'context', true);
+        addAnchor(fiber.ref?.current, 'ref', true);
+        addAnchor(fiber.type?.prototype, 'prototype', true);
+        const hooks = new Set();
+        for (let hook = fiber.memoizedState, count = 0; hook && typeof hook === 'object' &&
+          count < 8 && !hooks.has(hook); hook = hook.next, count++) {
+          hooks.add(hook);
+          addAnchor(hook.memoizedState, 'hook', true);
+        }
+        addAnchor(fiber.memoizedState, 'state', false);
+        addAnchor(fiber.memoizedProps, 'props', false);
+      } catch (_) { readErrors++; }
+    }
+    const readOwn = (value, key) => {
+      if (!value || typeof value !== 'object') return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return descriptor && 'value' in descriptor ? descriptor.value : undefined;
+    };
+    const addTank = (tank, path) => {
+      if (tank && typeof tank === 'object' && readOwn(tank, 'components_0') && !tanks.has(tank)) {
+        tanks.set(tank, path);
+      }
+    };
+    let highIndex = 0;
+    let lowIndex = 0;
+    let highVisited = 0;
+    while (inspected < MAX_OBJECTS && (highIndex < high.length || lowIndex < low.length)) {
+      const useHigh = highIndex < high.length && (highVisited < 850 || lowIndex >= low.length);
+      const { value, path, depth } = useHigh ? high[highIndex++] : low[lowIndex++];
+      if (useHigh) highVisited++;
+      inspected++;
+      try {
+        const ownKeys = Array.isArray(value) ? [] : Object.keys(value);
+        if (ownKeys.length > 96) fieldsTruncated++;
+        const keys = ownKeys.slice(0, 96);
+        if (keys.some(key => GAME_FIELD.test(key)) && hints.length < 8) {
+          const fields = keys.filter(key => GAME_FIELD.test(key) && !PRIVATE_FIELD.test(key))
+            .slice(0, 6).map(pathField);
+          if (fields.length) hints.push({ path, fields });
+        }
+        if (readOwn(value, 'tag') === 'LocalTank') addTank(value, path);
+        addTank(readOwn(value, 'possesedTank'), `${path}.possesedTank`);
+        addTank(readOwn(readOwn(value, 'gameMode_0'), 'possesedTank'),
+          `${path}.gameMode_0.possesedTank`);
+        if (readOwn(value, 'isPossessed') === true) addTank(readOwn(value, 'data'), `${path}.data`);
+        if (readOwn(value, 'state') && readOwn(value, 'subscribers')) {
+          addTank(findLocalTank(value), `${path}.store`);
+        }
+        if (readOwn(value, 'pivot_0') && readOwn(value, 'currState_0')) {
+          const missing = cameraProblems(value);
+          cameras.set(value, { path, missing });
+        }
+        if (depth >= MAX_DEPTH) continue;
+        if (Array.isArray(value)) {
+          for (const item of value.slice(0, 16)) enqueue(item, `${path}[]`, depth + 1);
+          continue;
+        }
+        // Read own data properties only; getters and methods on game objects
+        // must not be run by a diagnostic search.
+        const safeKeysToFollow = keys.filter(key =>
+          !PRIVATE_FIELD.test(key) && !key.startsWith('__react') && key !== '__proto__');
+        const likely = safeKeysToFollow.filter(key => ROUTE_FIELD.test(key)).slice(0, 24);
+        const other = safeKeysToFollow.filter(key => !ROUTE_FIELD.test(key)).slice(0, 8);
+        for (const key of [...likely, ...other]) {
+          const descriptor = Object.getOwnPropertyDescriptor(value, key);
+          if (!descriptor || !('value' in descriptor)) continue;
+          enqueue(descriptor.value, `${path}.${pathField(key)}`, depth + 1, ROUTE_FIELD.test(key));
+        }
+      } catch (_) { readErrors++; }
+    }
+    const compatible = [...cameras].filter(([, shape]) => shape.missing.length === 0);
+    const fromTanks = [...tanks].map(([tank, path]) => ({
+      camera: findCameraInTank(tank, tanks.size === 1 ? trace : null), path
+    })).filter(item => item.camera);
+    const localCompatible = fromTanks.filter(item => isCompatibleCamera(item.camera));
+    if (trace) trace.discovery = {
+      fibers: fibers.length,
+      anchors,
+      references: seen.size,
+      objectsChecked: inspected,
+      limitReached: inspected >= MAX_OBJECTS || seen.size >= MAX_REFERENCES,
+      fieldsTruncated,
+      readErrors,
+      localTanks: tanks.size,
+      cameraLike: cameras.size,
+      compatibleCameras: compatible.length,
+      hints,
+      candidates: [...cameras.values()].slice(0, 6).map(({ path, missing }) => ({ path, missing })),
+      selected: null,
+      path: null
+    };
+    const selected = (camera, source, path) => {
+      if (trace) Object.assign(trace.discovery, { selected: source, path });
+      return { camera, code: 'READY' };
+    };
+    if (localCompatible.length === 1) {
+      return selected(localCompatible[0].camera, 'localTank', localCompatible[0].path);
+    }
+    if (localCompatible.length > 1 || (tanks.size === 0 && compatible.length > 1)) {
+      return { camera: null, code: 'CAMERA_AMBIGUOUS' };
+    }
+    if (tanks.size) {
+      if (fromTanks.length) return { camera: fromTanks[0].camera, code: 'CAMERA_INCOMPATIBLE' };
+      return { camera: null, code: 'CAMERA_NOT_FOUND' };
+    }
+    // A unique camera with the full FollowCamera signature is safe to try as a
+    // local, reversible patch. Never guess if several plausible cameras exist.
+    if (compatible.length === 1) {
+      return selected(compatible[0][0], 'uniqueFollowCamera', compatible[0][1].path);
+    }
+    if (cameras.size === 1) return { camera: [...cameras.keys()][0], code: 'CAMERA_INCOMPATIBLE' };
+    return { camera: null, code: 'CAMERA_PATH_NOT_FOUND' };
+  }
+
   function resolveCamera(doc, trace) {
     const details = trace || {};
     const result = (camera, code, message = '') => {
@@ -398,32 +557,57 @@
       return { camera, code, message: camera ? '' : `[${code}] ${message}` };
     };
     try {
-      const store = findStore(doc, details);
-      if (!store) {
-        if (!details.root?.found && !details.root?.canvasFound && !details.react?.fiberFound) {
-          return result(null, 'ROOT_MISSING', 'Не загружены #root и canvas игры');
+      const fibers = [];
+      const store = findStore(doc, details, fibers);
+      let legacyFailure = null;
+      if (store) {
+        const tank = findLocalTank(store, details);
+        if (!tank) {
+          if (details.store?.inBattleError) return result(null, 'BATTLE_STATE_ERROR', 'Не удалось прочитать состояние боя');
+          if (details.store?.battleLoaded === false || details.store?.inBattle === false) {
+            return result(null, 'BATTLE_NOT_READY', 'Дождитесь загрузки боя');
+          }
+          legacyFailure = ['LOCAL_TANK_NOT_FOUND', 'Не найден локальный танк'];
+        } else {
+          const camera = findCameraInTank(tank, details);
+          if (camera && isCompatibleCamera(camera)) return result(camera, 'READY');
+          legacyFailure = camera ?
+            ['CAMERA_INCOMPATIBLE', `Не хватает поля ${cameraProblems(camera)[0]}`] :
+            ['CAMERA_NOT_FOUND', 'Камера не найдена в компонентах танка'];
         }
-        if (!details.react?.fiberFound) {
-          const hasMarker = Object.values(details.react?.markers || {}).some(count => count > 0);
-          return result(null, 'REACT_ROOT_MISSING', hasMarker ?
-            'Маркеры React видны, но Fiber недоступен' :
-            'На проверенных DOM-узлах не видна привязка React');
-        }
-        return result(null, 'STORE_NOT_FOUND', 'Не найден store игры');
       }
-      const tank = findLocalTank(store, details);
-      if (!tank) {
-        if (details.store?.inBattleError) return result(null, 'BATTLE_STATE_ERROR', 'Не удалось прочитать состояние боя');
-        if (details.store?.battleLoaded === false || details.store?.inBattle === false) {
-          return result(null, 'BATTLE_NOT_READY', 'Дождитесь загрузки боя');
+
+      // Do not require a Redux/Kotlin store: try the actual camera in the
+      // bounded React object graph before reporting why discovery failed.
+      const discovered = findCameraFromFibers(fibers, details);
+      if (discovered.camera) {
+        if (!store && !details.root?.canvasFound) {
+          return result(null, 'BATTLE_NOT_READY', 'Дождитесь загрузки canvas боя');
         }
-        return result(null, 'LOCAL_TANK_NOT_FOUND', 'Не найден локальный танк');
+        const missing = cameraProblems(discovered.camera);
+        if (!missing.length) return result(discovered.camera, 'READY');
+        return result(null, 'CAMERA_INCOMPATIBLE', `Не хватает поля ${missing[0]}`);
       }
-      const camera = findCameraInTank(tank, details);
-      if (!camera) return result(null, 'CAMERA_NOT_FOUND', 'Камера не найдена в компонентах танка');
-      const missing = cameraProblems(camera);
-      if (missing.length) return result(null, 'CAMERA_INCOMPATIBLE', `Не хватает поля ${missing[0]}`);
-      return result(camera, 'READY');
+      if (!details.root?.found && !details.root?.canvasFound && !details.react?.fiberFound) {
+        return result(null, 'ROOT_MISSING', 'Не загружены #root и canvas игры');
+      }
+      if (!details.react?.fiberFound) {
+        const hasMarker = Object.values(details.react?.markers || {}).some(count => count > 0);
+        return result(null, 'REACT_ROOT_MISSING', hasMarker ?
+          'Маркеры React видны, но Fiber недоступен' :
+          'На проверенных DOM-узлах не видна привязка React');
+      }
+      if (discovered.code === 'CAMERA_AMBIGUOUS') {
+        return result(null, 'CAMERA_AMBIGUOUS', 'Несколько подходящих камер — выбор небезопасен');
+      }
+      if (legacyFailure && discovered.code === 'CAMERA_PATH_NOT_FOUND') {
+        return result(null, ...legacyFailure);
+      }
+      if (discovered.code === 'CAMERA_NOT_FOUND') {
+        return result(null, 'CAMERA_NOT_FOUND', 'Камера не найдена в компонентах локального танка');
+      }
+      return result(null, 'CAMERA_PATH_NOT_FOUND',
+        'Камера не достижима из проверенных React-компонентов — откройте диагностику');
     } catch (error) {
       details.error = safeError(error);
       return result(null, 'PROBE_EXCEPTION', 'Ошибка поиска камеры — откройте диагностику');

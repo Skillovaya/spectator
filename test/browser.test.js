@@ -178,6 +178,27 @@ test('the button resolves the camera through canvas when #root has no React hand
   assert.equal(camera.pivot_0.update_sl07mc$, originalPivot);
 });
 
+test('the button can patch a unique camera reachable from React props without a store', () => {
+  const camera = makeCamera();
+  const doc = new FakeDocument(camera);
+  const win = new FakeWindow(doc);
+  const originalPivot = camera.pivot_0.update_sl07mc$;
+  doc.rootElement = { children: [] };
+  doc.canvas['__reactFiber$canvas'] = { return: {
+    memoizedProps: { game: { camera } }
+  } };
+  bootstrap(win);
+  doc.button.dispatchEvent(new Event('click'));
+  assert.match(doc.status.textContent, /откреплена/);
+  assert.notEqual(camera.pivot_0.update_sl07mc$, originalPivot);
+  doc.logButton.dispatchEvent(new Event('click'));
+  const log = JSON.parse(doc.logArea.value);
+  assert.ok(log.events.some(event => event.code === 'CAMERA_PROBE' &&
+    event.details.trace.discovery.selected === 'uniqueFollowCamera'));
+  win.dispatchEvent(new Event('pagehide'));
+  assert.equal(camera.pivot_0.update_sl07mc$, originalPivot);
+});
+
 test('changing battles restores the camera automatically', () => {
   const camera = makeCamera();
   const doc = new FakeDocument(camera);
@@ -211,7 +232,7 @@ test('red status persists and copy button returns a structural failure log', asy
   await new Promise(setImmediate);
   assert.equal(win.copied.length, 1);
   const log = JSON.parse(win.copied[0]);
-  assert.equal(log.version, '0.3.0');
+  assert.equal(log.version, '0.4.0');
   assert.equal(log.host, 'tankionline.com');
   assert.ok(log.events.some(event => event.code === 'CAMERA_PROBE' &&
     event.details.trace.result === 'CAMERA_INCOMPATIBLE'));
@@ -265,7 +286,7 @@ test('clipboard denial selects the visible log for manual copying', async () => 
   win.navigator.clipboard.writeText = async () => { throw Error('denied'); };
   bootstrap(win);
   doc.button.dispatchEvent(new Event('click'));
-  assert.match(doc.status.textContent, /ROOT_MISSING/);
+  assert.match(doc.status.textContent, /\[REACT_ROOT_MISSING\]/);
   doc.logButton.dispatchEvent(new Event('click'));
   doc.copyButton.dispatchEvent(new Event('click'));
   await new Promise(setImmediate);
