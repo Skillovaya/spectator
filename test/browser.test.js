@@ -159,6 +159,25 @@ test('installed userscript blocks game movement, flies, releases lock and restor
   assert.equal(win.interval, null);
 });
 
+test('the button resolves the camera through canvas when #root has no React handle', () => {
+  const camera = makeCamera();
+  const doc = new FakeDocument(camera);
+  const win = new FakeWindow(doc);
+  const originalPivot = camera.pivot_0.update_sl07mc$;
+  doc.rootElement = { children: [] };
+  doc.canvas['__reactFiber$canvas'] = { return: { stateNode: { store: doc.store } } };
+  bootstrap(win);
+  doc.button.dispatchEvent(new Event('click'));
+  assert.match(doc.status.textContent, /откреплена/);
+  assert.notEqual(camera.pivot_0.update_sl07mc$, originalPivot);
+  doc.logButton.dispatchEvent(new Event('click'));
+  const log = JSON.parse(doc.logArea.value);
+  assert.ok(log.events.some(event => event.code === 'CAMERA_PROBE' &&
+    event.details.trace.react.source === 'canvas'));
+  win.dispatchEvent(new Event('pagehide'));
+  assert.equal(camera.pivot_0.update_sl07mc$, originalPivot);
+});
+
 test('changing battles restores the camera automatically', () => {
   const camera = makeCamera();
   const doc = new FakeDocument(camera);
@@ -192,7 +211,7 @@ test('red status persists and copy button returns a structural failure log', asy
   await new Promise(setImmediate);
   assert.equal(win.copied.length, 1);
   const log = JSON.parse(win.copied[0]);
-  assert.equal(log.version, '0.2.0');
+  assert.equal(log.version, '0.3.0');
   assert.equal(log.host, 'tankionline.com');
   assert.ok(log.events.some(event => event.code === 'CAMERA_PROBE' &&
     event.details.trace.result === 'CAMERA_INCOMPATIBLE'));

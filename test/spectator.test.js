@@ -62,7 +62,7 @@ test('finds a local battle camera through the React 17 store', () => {
 test('diagnostic trace distinguishes a missing root, store, tank and camera', () => {
   const absent = {};
   assert.equal(resolveCamera({ getElementById: () => null }, absent).code, 'ROOT_MISSING');
-  assert.deepEqual(absent.root, { found: false, canvasFound: false });
+  assert.deepEqual(absent.root, { found: false, canvasFound: false, childCount: null });
 
   const noStore = {};
   const rootWithoutStore = { getElementById: () => ({ '__reactContainer$abc': { child: {} } }) };
@@ -99,6 +99,97 @@ test('finds a store in a React 18 Fiber child and handles missing battle', () =>
   store.state.battleStatistics.inBattle = () => false;
   assert.equal(resolveCamera(doc).camera, null);
   assert.equal(resolveCamera(doc).code, 'BATTLE_NOT_READY');
+});
+
+test('finds a store from a canvas Fiber when #root has no React handle', () => {
+  const store = makeStore(makeCamera());
+  const root = { children: [] };
+  const canvas = { parentElement: root };
+  const fiber = { return: { memoizedProps: { store } } };
+  canvas['__reactFiber$private-random-suffix'] = fiber;
+  const doc = {
+    getElementById: () => root,
+    querySelector: () => canvas,
+    body: { children: [root] }
+  };
+  const trace = {};
+  assert.equal(resolveCamera(doc, trace).code, 'READY');
+  assert.equal(trace.react.handle, 'fiber');
+  assert.equal(trace.react.source, 'canvas');
+  assert.deepEqual(trace.react.markers, { react17: 0, react18: 0, fiber: 1 });
+  assert.equal(trace.react.nodesChecked, 2);
+  assert.ok(trace.react.domNodesChecked >= 3);
+  const diagnostics = createDiagnostics({ location: { hostname: 'tankionline.com' } });
+  diagnostics.record('info', 'CAMERA_PROBE', { trace });
+  assert.ok(!diagnostics.report().includes('private-random-suffix'));
+});
+
+test('finds a React container in a sibling of #root without walking globals', () => {
+  const store = makeStore(makeCamera());
+  const root = { children: [] };
+  const sibling = { children: [], '__reactContainer$random-suffix': { current: {
+    child: { memoizedState: { store } }
+  } } };
+  const body = { children: [root, sibling] };
+  const trace = {};
+  assert.equal(findStore({ getElementById: () => root, body }, trace), store);
+  assert.equal(trace.react.handle, 'react18');
+  assert.equal(trace.react.source, 'descendant');
+  assert.equal(trace.react.storePath, 'memoizedState.store');
+});
+
+test('finds a store in a descendant Fiber hook and bounds cyclic Fiber traversal', () => {
+  const store = makeStore(makeCamera());
+  const hook = { memoizedState: { store } };
+  hook.next = hook;
+  const fiber = { memoizedState: hook };
+  fiber.alternate = fiber;
+  const root = { children: [{ '__reactInternalInstance$random-suffix': fiber }] };
+  const trace = {};
+  assert.equal(findStore({ getElementById: () => root }, trace), store);
+  assert.equal(trace.react.source, 'descendant');
+  assert.equal(trace.react.storePath, 'hook[0].memoizedState.store');
+  assert.equal(trace.react.nodesChecked, 1);
+});
+
+test('bounds DOM and Fiber inspection even when the tree is large or cyclic', () => {
+  const rootFiber = {};
+  let fiber = rootFiber;
+  for (let index = 0; index < 750; index++) {
+    fiber.sibling = {};
+    fiber = fiber.sibling;
+  }
+  fiber.sibling = rootFiber;
+  const root = { '__reactContainer$limited': rootFiber, children: [] };
+  const body = { children: [root, ...Array.from({ length: 150 }, () => ({ children: [] }))] };
+  const trace = {};
+  assert.equal(findStore({ getElementById: () => root, body }, trace), null);
+  assert.ok(trace.react.domNodesChecked <= 128);
+  assert.equal(trace.react.nodesChecked, 700);
+  assert.equal(trace.react.searchLimitReached, true);
+});
+
+test('reports a visible marker without an active Fiber separately from isolation', () => {
+  const root = { '__reactContainer$not-mounted': null };
+  for (let index = 0; index < 300; index++) root[`unrelated${index}`] = true;
+  const trace = {};
+  const result = resolveCamera({ getElementById: () => root }, trace);
+  assert.equal(result.code, 'REACT_ROOT_MISSING');
+  assert.match(result.message, /Fiber недоступен/);
+  assert.deepEqual(trace.react.markers, { react17: 0, react18: 1, fiber: 0 });
+  assert.equal(trace.react.fiberFound, false);
+  assert.equal(trace.react.domKeysTruncated, 1);
+});
+
+test('reports no visible React marker even when a canvas exists', () => {
+  const root = { children: [] };
+  const canvas = { parentElement: root };
+  const trace = {};
+  assert.equal(resolveCamera({ getElementById: () => root, querySelector: () => canvas }, trace).code,
+    'REACT_ROOT_MISSING');
+  assert.deepEqual(trace.react.markers, { react17: 0, react18: 0, fiber: 0 });
+  assert.equal(trace.react.nodesChecked, 0);
+  assert.ok(trace.react.domNodesChecked >= 2);
 });
 
 test('supports the game-mode possessed tank layout and reports unknown camera shapes', () => {

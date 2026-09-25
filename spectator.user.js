@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Tanki Online — Spectator (свободная камера)
 // @namespace    https://github.com/Skillovaya/spectator
-// @version      0.2.0
+// @version      0.3.0
 // @description  Локальная свободная камера в браузерной версии Танков Онлайн; не даёт права настоящего спектатора.
 // @match        https://tankionline.com/play*
 // @match        https://*.tankionline.com/play*
 // @run-at       document-start
 // @grant        none
+// @sandbox      raw
+// @inject-into  page
 // @noframes
 // ==/UserScript==
 
@@ -15,7 +17,7 @@
 
   // These are private names of the HTML5 client's FollowCamera, not a public API.
   // If the client changes, fail closed rather than modifying a different object.
-  const VERSION = '0.2.0';
+  const VERSION = '0.3.0';
   const PIVOT_UPDATE = 'update_sl07mc$';
   const NUMBER_UPDATE = 'update_dleff0$';
   const MOVE_KEYS = new Set([
@@ -145,58 +147,131 @@
 
   function findStore(doc, trace) {
     const root = doc.getElementById('root');
+    const canvas = doc.querySelector?.('canvas');
     if (trace) trace.root = {
       found: Boolean(root),
-      canvasFound: Boolean(doc.querySelector?.('canvas'))
+      canvasFound: Boolean(canvas),
+      childCount: root?.children?.length ?? null
     };
-    if (!root) return null;
 
-    // React 17 and React 18 expose different root handles. Inspect only the
-    // bounded Fiber tree, never window or the game's entire object graph.
-    const reactKey = Object.keys(root).find(key => key.startsWith('__reactContainer$'));
-    const react17 = root._reactRootContainer?._internalRoot?.current ||
-      root._reactRootContainer?.current;
-    const react18 = reactKey && (root[reactKey]?.current || root[reactKey]);
-    const fiber = react17 || react18;
+    // The game may mount React under #root, in a sibling, or around the WebGL
+    // canvas. Inspect a bounded set of DOM nodes; never crawl window/globals.
+    const elements = [];
+    const seenElements = new Set();
+    const addElement = (element, source) => {
+      if (!element || typeof element !== 'object' || seenElements.has(element) || elements.length >= 128) return;
+      seenElements.add(element);
+      elements.push({ element, source });
+    };
+    addElement(root, 'root');
+    addElement(canvas, 'canvas');
+    for (let element = canvas?.parentElement, depth = 0; element && depth < 10;
+      element = element.parentElement, depth++) addElement(element, 'canvas.ancestor');
+    for (let element = root?.parentElement, depth = 0; element && depth < 4;
+      element = element.parentElement, depth++) addElement(element, 'root.ancestor');
+    addElement(doc.body, 'body');
+    addElement(doc.documentElement, 'document');
+
+    const domQueue = [root, doc.body];
+    const scanned = new Set();
+    for (let index = 0; index < domQueue.length && elements.length < 128 && index < 128; index++) {
+      const element = domQueue[index];
+      if (!element || scanned.has(element)) continue;
+      scanned.add(element);
+      const children = element.children;
+      for (let child = 0; children && child < Math.min(children.length, 16); child++) {
+        addElement(children[child], 'descendant');
+        domQueue.push(children[child]);
+      }
+    }
+
+    const seeds = [];
+    const markers = { react17: 0, react18: 0, fiber: 0 };
+    const addSeed = (fiber, kind, source) => {
+      markers[kind]++;
+      if (fiber && typeof fiber === 'object' && seeds.length < 128) {
+        seeds.push({ fiber, kind, source });
+      }
+    };
+    let domReadErrors = 0;
+    let domKeysTruncated = 0;
+    for (const { element, source } of elements) {
+      try {
+        const legacy = element._reactRootContainer;
+        if (legacy) addSeed(legacy._internalRoot?.current || legacy.current, 'react17', source);
+        const keys = Object.keys(element);
+        if (keys.length > 256) domKeysTruncated++;
+        for (const key of keys.slice(0, 256)) {
+          if (key.startsWith('__reactContainer$')) {
+            addSeed(element[key]?.current || element[key], 'react18', source);
+          } else if (key.startsWith('__reactFiber$') || key.startsWith('__reactInternalInstance$')) {
+            addSeed(element[key], 'fiber', source);
+          }
+        }
+      } catch (_) { domReadErrors++; }
+    }
     if (trace) trace.react = {
-      handle: react17 ? 'react17' : react18 ? 'react18' : 'none',
-      fiberFound: Boolean(fiber),
+      handle: seeds[0]?.kind || 'none',
+      source: seeds[0]?.source || null,
+      fiberFound: seeds.length > 0,
       nodesChecked: 0,
+      domNodesChecked: elements.length,
+      domReadErrors,
+      domKeysTruncated,
+      markers,
       storePath: null
     };
-    if (!fiber) return null;
+    if (!seeds.length) return null;
 
-    const queue = [fiber];
+    const isGameStore = value => Boolean(value && typeof value === 'object' &&
+      value.subscribers && value.state);
+    const queue = seeds.slice();
     const visited = new Set();
-    for (let index = 0; index < queue.length && index < 500; index++) {
-      const node = queue[index];
+    for (let index = 0; index < queue.length && visited.size < 700; index++) {
+      const { fiber: node, kind, source } = queue[index];
       if (!node || typeof node !== 'object' || visited.has(node)) continue;
       visited.add(node);
       if (trace) trace.react.nodesChecked = visited.size;
+      const found = (store, path) => {
+        if (!isGameStore(store)) return null;
+        if (trace) Object.assign(trace.react, { handle: kind, source, storePath: path });
+        return store;
+      };
       try {
         const candidates = [
           ['memoizedState.element.type.prototype.store', node.memoizedState?.element?.type?.prototype?.store],
           ['type.prototype.store', node.type?.prototype?.store],
           ['stateNode.store', node.stateNode?.store],
           ['memoizedProps.store', node.memoizedProps?.store],
-          ['memoizedState.store', node.memoizedState?.store]
+          ['memoizedProps.value', node.memoizedProps?.value],
+          ['memoizedState.store', node.memoizedState?.store],
+          ['memoizedState.element.props.store', node.memoizedState?.element?.props?.store],
+          ['stateNode.context.store', node.stateNode?.context?.store]
         ];
-        for (const [path, store] of candidates) {
-          if (store?.subscribers && store?.state) {
-            if (trace) trace.react.storePath = path;
-            return store;
-          }
+        for (const [path, value] of candidates) {
+          const store = found(value, path);
+          if (store) return store;
         }
-        queue.push(node.child, node.sibling);
+        // Function components may hold the store in the first few React hooks.
+        const checkedHooks = new Set();
+        for (let hook = node.memoizedState, count = 0; hook && typeof hook === 'object' &&
+          count < 8 && !checkedHooks.has(hook); hook = hook.next, count++) {
+          checkedHooks.add(hook);
+          const store = found(hook.memoizedState, `hook[${count}].memoizedState`) ||
+            found(hook.memoizedState?.store, `hook[${count}].memoizedState.store`);
+          if (store) return store;
+        }
+        for (const fiber of [node.return, node.child, node.sibling, node.alternate]) {
+          if (fiber && !visited.has(fiber)) queue.push({ fiber, kind, source });
+        }
       } catch (error) {
-        // A Fiber can unmount mid-read; keep looking and note the first error.
         if (trace) {
           trace.react.nodeReadErrors = (trace.react.nodeReadErrors || 0) + 1;
           trace.react.firstNodeError ||= safeError(error);
         }
       }
     }
-    if (trace) trace.react.searchLimitReached = queue.length > 500;
+    if (trace) trace.react.searchLimitReached = visited.size >= 700;
     return null;
   }
 
@@ -325,8 +400,15 @@
     try {
       const store = findStore(doc, details);
       if (!store) {
-        if (!details.root?.found) return result(null, 'ROOT_MISSING', 'Не найден #root игры');
-        if (!details.react?.fiberFound) return result(null, 'REACT_ROOT_MISSING', 'Не найден корень React');
+        if (!details.root?.found && !details.root?.canvasFound && !details.react?.fiberFound) {
+          return result(null, 'ROOT_MISSING', 'Не загружены #root и canvas игры');
+        }
+        if (!details.react?.fiberFound) {
+          const hasMarker = Object.values(details.react?.markers || {}).some(count => count > 0);
+          return result(null, 'REACT_ROOT_MISSING', hasMarker ?
+            'Маркеры React видны, но Fiber недоступен' :
+            'На проверенных DOM-узлах не видна привязка React');
+        }
         return result(null, 'STORE_NOT_FOUND', 'Не найден store игры');
       }
       const tank = findLocalTank(store, details);
