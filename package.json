@@ -1,0 +1,13 @@
+{
+  "name": "tanki-spectator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Локальная свободная камера для браузерной версии Танков Онлайн",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check spectator.user.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
