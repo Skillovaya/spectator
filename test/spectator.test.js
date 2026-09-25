@@ -2,7 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   asArray, findStore, findLocalTank, resolveCamera, isCompatibleCamera,
-  createFlight, stepFlight, lookFlight, attachFreeCamera
+  cameraProblems, createDiagnostics, safeError, createFlight, stepFlight,
+  lookFlight, attachFreeCamera
 } = require('../spectator.user.js');
 
 function makeCamera() {
@@ -55,13 +56,38 @@ test('finds a local battle camera through the React 17 store', () => {
   const doc = docFor17(store);
   assert.equal(findStore(doc), store);
   assert.equal(findLocalTank(store).tag, 'LocalTank');
-  assert.deepEqual(resolveCamera(doc), { camera, message: '' });
+  assert.deepEqual(resolveCamera(doc), { camera, code: 'READY', message: '' });
+});
+
+test('diagnostic trace distinguishes a missing root, store, tank and camera', () => {
+  const absent = {};
+  assert.equal(resolveCamera({ getElementById: () => null }, absent).code, 'ROOT_MISSING');
+  assert.deepEqual(absent.root, { found: false, canvasFound: false });
+
+  const noStore = {};
+  const rootWithoutStore = { getElementById: () => ({ '__reactContainer$abc': { child: {} } }) };
+  assert.equal(resolveCamera(rootWithoutStore, noStore).code, 'STORE_NOT_FOUND');
+  assert.equal(noStore.react.handle, 'react18');
+  assert.ok(noStore.react.nodesChecked > 0);
+
+  const store = makeStore(makeCamera());
+  store.subscribers.array_hd7ov6$_0 = [{ tank: { tag: 'EnemyTank' } }];
+  const missingTank = {};
+  assert.equal(resolveCamera(docFor17(store), missingTank).code, 'LOCAL_TANK_NOT_FOUND');
+  assert.equal(missingTank.store.subscribers.count, 1);
+  assert.equal(missingTank.store.subscriberSample[0].isLocalTank, false);
+
+  store.subscribers.array_hd7ov6$_0 = [{ tank: { tag: 'LocalTank', components_0: { array: [] } } }];
+  const missingCamera = {};
+  assert.equal(resolveCamera(docFor17(store), missingCamera).code, 'CAMERA_NOT_FOUND');
+  assert.equal(missingCamera.cameraSearch.componentCount, 0);
 });
 
 test('a store unmounting mid-read does not throw or patch a camera', () => {
   const doc = { getElementById: () => { throw Error('unmounted'); } };
-  assert.equal(resolveCamera(doc).camera, null);
-  assert.match(resolveCamera(doc).message, /Ожидание/);
+  const trace = {};
+  assert.equal(resolveCamera(doc, trace).code, 'PROBE_EXCEPTION');
+  assert.match(trace.error.message, /unmounted/);
 });
 
 test('finds a store in a React 18 Fiber child and handles missing battle', () => {
@@ -72,7 +98,7 @@ test('finds a store in a React 18 Fiber child and handles missing battle', () =>
   assert.equal(findStore(doc), store);
   store.state.battleStatistics.inBattle = () => false;
   assert.equal(resolveCamera(doc).camera, null);
-  assert.match(resolveCamera(doc).message, /Откройте бой/);
+  assert.equal(resolveCamera(doc).code, 'BATTLE_NOT_READY');
 });
 
 test('supports the game-mode possessed tank layout and reports unknown camera shapes', () => {
@@ -89,8 +115,49 @@ test('supports the game-mode possessed tank layout and reports unknown camera sh
   assert.equal(resolveCamera(docFor17(store)).camera, camera);
   delete camera.pitch_0.update_dleff0$;
   assert.equal(isCompatibleCamera(camera), false);
-  assert.equal(resolveCamera(docFor17(store)).camera, null);
-  assert.match(resolveCamera(docFor17(store)).message, /не поддерживается/);
+  const trace = {};
+  assert.equal(resolveCamera(docFor17(store), trace).code, 'CAMERA_INCOMPATIBLE');
+  assert.ok(cameraProblems(camera).includes('pitch_0.update_dleff0$'));
+  assert.ok(trace.cameraSearch.candidates[0].missing.includes('pitch_0.update_dleff0$'));
+});
+
+test('diagnostic report describes camera shape without account or position values', () => {
+  const camera = makeCamera();
+  camera.nickname = 'PRIVATE_PLAYER';
+  camera.pivot_0.value.x = 31415926;
+  delete camera.pitch_0.update_dleff0$;
+  const store = makeStore(camera);
+  const trace = {};
+  assert.equal(resolveCamera(docFor17(store), trace).code, 'CAMERA_INCOMPATIBLE');
+  const diagnostics = createDiagnostics({
+    location: { hostname: 'tankionline.com' },
+    console: { warn() {} }
+  });
+  diagnostics.record('warn', 'CAMERA_PROBE', {
+    trace, authToken: 'SECRET_TOKEN_123', accountEmail: 'person@example.com', rawGame: store,
+    url: 'https://tankionline.com/play/?session=secret'
+  });
+  const report = diagnostics.report();
+  assert.match(report, /CAMERA_INCOMPATIBLE/);
+  assert.match(report, /pitch_0\.update_dleff0\$/);
+  assert.match(report, /followCamera_0/);
+  for (const secret of ['PRIVATE_PLAYER', '31415926', 'SECRET_TOKEN_123', 'person@example.com',
+    'session=secret']) {
+    assert.ok(!report.includes(secret), `report leaked ${secret}`);
+  }
+  assert.match(report, /<hidden field>/);
+  assert.ok(!report.includes('rawGame')); // Unexpected log fields are dropped altogether.
+});
+
+test('diagnostic log has a bounded size and scrubs error URLs', () => {
+  const diagnostics = createDiagnostics({ location: { hostname: 'tankionline.com' }, console: {} });
+  for (let i = 0; i < 100; i++) diagnostics.record('info', 'TEST_EVENT', { syncs: i });
+  const report = JSON.parse(diagnostics.report());
+  assert.ok(report.events.length <= 50);
+  assert.equal(report.events.at(-1).details.syncs, 99);
+  const error = safeError(new Error('Missing field at https://tankionline.com/play/?auth=secret'));
+  assert.match(error.message, /<url>/);
+  assert.ok(!error.stack.includes('auth=secret'));
 });
 
 test('prefers a real FollowCamera over a similarly named controller', () => {
